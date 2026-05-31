@@ -1,8 +1,3 @@
-"""Reusable training building blocks for the Dagster pipeline.
-
-These functions are extracted from the Block 1 ``train_model.py`` so the
-Dagster assets in ``dagster_pipeline.py`` stay short and easy to read.
-"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -20,7 +15,6 @@ from torchvision import models, transforms
 
 @dataclass
 class TrainConfig:
-    """All knobs that affect a single training run."""
     epochs: int
     batch_size: int
     learning_rate: float
@@ -34,7 +28,6 @@ class TrainConfig:
 
 
 class BiomassDataset(Dataset):
-    """Image -> fresh_weight_total (grams) regression dataset."""
 
     def __init__(self, df: pd.DataFrame, image_dir: Path, transform: transforms.Compose) -> None:
         self.df = df.reset_index(drop=True)
@@ -98,7 +91,6 @@ def build_model(model_name: str, freeze_backbone: bool) -> nn.Module:
 def split_dataframe(
     df: pd.DataFrame, val_fraction: float, seed: int
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Drop rows with missing target and split plant-disjoint train / val sets."""
     df = df.dropna(subset=["fresh_weight_total"]).copy()
     plant_ids = df["plant_number"].astype(str) + "_" + df["experiment_id"].astype(str)
     df["_plant_key"] = plant_ids
@@ -127,7 +119,6 @@ def run_epoch(
     device: torch.device,
     max_batches: int = 0,
 ) -> tuple[float, float]:
-    """One epoch. Returns (MSE, MAE). optimizer=None puts the model in eval."""
     is_train = optimizer is not None
     model.train(is_train)
 
@@ -159,7 +150,6 @@ def run_epoch(
 def predict_all(
     model: nn.Module, loader: DataLoader, device: torch.device
 ) -> tuple[list[float], list[float]]:
-    """Run the model on the loader and return (predictions, targets) in grams."""
     model.eval()
     preds_all: list[float] = []
     targets_all: list[float] = []

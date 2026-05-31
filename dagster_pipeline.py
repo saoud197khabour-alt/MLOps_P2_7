@@ -1,22 +1,3 @@
-"""Dagster pipeline for the plant biomass regression task (Block 2).
-
-Five assets are defined:
-
-    raw_dataset        -> load metadata + image paths
-    preprocessed_data  -> build train / val PyTorch DataLoaders
-    eda_plots          -> generate EDA figures (optional)
-    trained_model      -> train the ResNet and log to MLflow
-    model_evaluation   -> evaluate on val set, save plots and metrics
-
-Run the UI with:
-
-    dagster dev -f dagster_pipeline.py
-
-Run the MLflow UI with:
-
-    mlflow ui --backend-store-uri sqlite:///mlflow.db
-"""
-
 import json
 import os
 import random
@@ -53,7 +34,6 @@ SCREENSHOTS_DIR = PROJECT_DIR / "screenshots"
 for d in (FIGURES_DIR, RESULTS_DIR, SCREENSHOTS_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
-# Small, deterministic config so the lab pipeline finishes quickly on a laptop.
 CONFIG = TrainConfig(
     epochs=2,
     batch_size=32,
@@ -63,8 +43,8 @@ CONFIG = TrainConfig(
     val_fraction=0.2,
     seed=42,
     freeze_backbone=True,
-    max_train_batches=15,   # ~15 batches/epoch ≈ 480 images, enough to see learning
-    num_workers=0,          # 0 avoids MPS / macOS worker hangs
+    max_train_batches=15,
+    num_workers=0,
 )
 
 
@@ -74,12 +54,8 @@ def _seed_everything(seed: int) -> None:
     torch.manual_seed(seed)
 
 
-# ---------------------------------------------------------------------------
-# 1. raw_dataset
-# ---------------------------------------------------------------------------
 @asset
 def raw_dataset(context: AssetExecutionContext) -> dict:
-    """Load metadata Excel and image filenames from disk."""
     xlsx = DATA_DIR / "digital_biomass_labels.xlsx"
     image_dir = DATA_DIR / "images_med_res"
     context.log.info("Loading metadata from %s", xlsx)
@@ -94,7 +70,6 @@ def raw_dataset(context: AssetExecutionContext) -> dict:
     image_paths = [str(image_dir / f) for f in df["filename"].tolist()]
     context.log.info("Rows: %d | image files referenced: %d", len(df), len(image_paths))
 
-    # Dagster persists asset outputs with pickle by default — dataframe + list works.
     return {
         "metadata": df,
         "image_paths": image_paths,
@@ -102,12 +77,8 @@ def raw_dataset(context: AssetExecutionContext) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# 2. preprocessed_data
-# ---------------------------------------------------------------------------
 @asset
 def preprocessed_data(context: AssetExecutionContext, raw_dataset: dict) -> dict:
-    """Resize/normalize images and build train + val DataLoaders."""
     _seed_everything(CONFIG.seed)
 
     df = raw_dataset["metadata"]
@@ -140,12 +111,8 @@ def preprocessed_data(context: AssetExecutionContext, raw_dataset: dict) -> dict
     }
 
 
-# ---------------------------------------------------------------------------
-# 3. eda_plots (optional asset)
-# ---------------------------------------------------------------------------
 @asset
 def eda_plots(context: AssetExecutionContext, raw_dataset: dict) -> dict:
-    """Generate two quick EDA figures: target distribution and biomass vs age."""
     df: pd.DataFrame = raw_dataset["metadata"]
 
     target = df["fresh_weight_total"].dropna()
@@ -174,12 +141,8 @@ def eda_plots(context: AssetExecutionContext, raw_dataset: dict) -> dict:
     return {"target_distribution": str(target_path), "age_vs_biomass": str(age_path)}
 
 
-# ---------------------------------------------------------------------------
-# 4. trained_model (with MLflow tracking)
-# ---------------------------------------------------------------------------
 @asset(required_resource_keys={"mlflow"})
 def trained_model(context: AssetExecutionContext, preprocessed_data: dict) -> dict:
-    """Train the ResNet on the preprocessed loaders, tracking with MLflow."""
     _seed_everything(CONFIG.seed)
     device = pick_device()
     context.log.info("Device: %s", device)
@@ -192,7 +155,6 @@ def trained_model(context: AssetExecutionContext, preprocessed_data: dict) -> di
     optimizer = optim.Adam(trainable, lr=CONFIG.learning_rate)
     criterion = nn.MSELoss()
 
-    # The dagster-mlflow resource already opened a run. Log everything into it.
     mlflow.log_params({
         "epochs": CONFIG.epochs,
         "batch_size": CONFIG.batch_size,
@@ -232,7 +194,6 @@ def trained_model(context: AssetExecutionContext, preprocessed_data: dict) -> di
         )
         best_val_mse = min(best_val_mse, val_mse)
 
-    # Save the model weights as an MLflow artifact and to disk.
     model_path = RESULTS_DIR / "model.pt"
     torch.save({
         "model_state_dict": model.state_dict(),
@@ -240,7 +201,7 @@ def trained_model(context: AssetExecutionContext, preprocessed_data: dict) -> di
         "best_val_mse": best_val_mse,
     }, model_path)
     mlflow.log_artifact(str(model_path), artifact_path="model")
-    context.log.info("Saved model weights to %s and logged as MLflow artifact", model_path)
+    context.log.info("Model saved to %s", model_path)
 
     return {
         "model_state_dict": model.state_dict(),
@@ -250,16 +211,12 @@ def trained_model(context: AssetExecutionContext, preprocessed_data: dict) -> di
     }
 
 
-# ---------------------------------------------------------------------------
-# 5. model_evaluation
-# ---------------------------------------------------------------------------
 @asset(required_resource_keys={"mlflow"})
 def model_evaluation(
     context: AssetExecutionContext,
     trained_model: dict,
     preprocessed_data: dict,
 ) -> dict:
-    """Evaluate on val set: write training curves, parity plot, metrics file."""
     device = pick_device()
     val_loader: DataLoader = preprocessed_data["val_loader"]
 
@@ -273,7 +230,6 @@ def model_evaluation(
     val_mae = float(np.abs(preds_a - targets_a).mean())
     context.log.info("Final val MSE %.5f MAE %.5f", val_mse, val_mae)
 
-    # Training curves
     history = trained_model["history"]
     epochs = range(1, len(history["train_mse"]) + 1)
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
@@ -289,7 +245,6 @@ def model_evaluation(
     curves_path = RESULTS_DIR / "training_curves.png"
     fig.savefig(curves_path, dpi=130, bbox_inches="tight"); plt.close(fig)
 
-    # Parity plot: predicted vs actual on val
     fig, ax = plt.subplots(figsize=(6, 6))
     ax.scatter(targets_a, preds_a, s=14, alpha=0.55, color="#3b6e8f")
     lo = float(min(targets_a.min(), preds_a.min()))
@@ -301,7 +256,6 @@ def model_evaluation(
     parity_path = RESULTS_DIR / "parity_plot.png"
     fig.savefig(parity_path, dpi=130, bbox_inches="tight"); plt.close(fig)
 
-    # Metrics file
     metrics_path = RESULTS_DIR / "metrics.txt"
     metrics_path.write_text(
         "# Final evaluation metrics (validation set)\n"
@@ -314,7 +268,6 @@ def model_evaluation(
         + json.dumps(trained_model["config"], indent=2)
     )
 
-    # Log evaluation artifacts to MLflow too.
     mlflow.log_metric("final_val_mse", val_mse)
     mlflow.log_metric("final_val_mae", val_mae)
     mlflow.log_artifact(str(curves_path), artifact_path="evaluation")
@@ -331,9 +284,6 @@ def model_evaluation(
     }
 
 
-# ---------------------------------------------------------------------------
-# Definitions: register assets and the MLflow resource
-# ---------------------------------------------------------------------------
 MLFLOW_TRACKING_URI = f"sqlite:///{(PROJECT_DIR / 'mlflow.db').as_posix()}"
 
 defs = Definitions(
@@ -348,7 +298,6 @@ defs = Definitions(
 
 
 if __name__ == "__main__":
-    # Allow `python dagster_pipeline.py` to materialize the pipeline programmatically.
     import dagster as dg
 
     result = dg.materialize(
