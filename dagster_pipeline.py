@@ -1,7 +1,7 @@
+import base64
 import json
 import os
 import random
-from dataclasses import asdict
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -11,13 +11,18 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from dagster import AssetExecutionContext, Definitions, asset
+from dagster import (
+    AssetExecutionContext,
+    Config,
+    Definitions,
+    MetadataValue,
+    asset,
+)
 from dagster_mlflow import mlflow_tracking
 from torch.utils.data import DataLoader
 
 from training_utils import (
     BiomassDataset,
-    TrainConfig,
     build_model,
     build_transforms,
     pick_device,
@@ -34,24 +39,35 @@ SCREENSHOTS_DIR = PROJECT_DIR / "screenshots"
 for d in (FIGURES_DIR, RESULTS_DIR, SCREENSHOTS_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
-CONFIG = TrainConfig(
-    epochs=2,
-    batch_size=32,
-    learning_rate=1e-4,
-    model_name="resnet18",
-    image_size=224,
-    val_fraction=0.2,
-    seed=42,
-    freeze_backbone=True,
-    max_train_batches=15,
-    num_workers=0,
-)
+
+
+class PreprocessConfig(Config):
+    image_size: int = 224
+    batch_size: int = 32
+    val_fraction: float = 0.2
+    seed: int = 42
+    num_workers: int = 0
+
+
+class TrainingConfig(Config):
+    epochs: int = 2
+    learning_rate: float = 1e-4
+    model_name: str = "resnet18"
+    freeze_backbone: bool = True
+    max_train_batches: int = 15
+    seed: int = 42
 
 
 def _seed_everything(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+
+
+def _png_as_markdown(path: Path, alt: str) -> MetadataValue:
+    
+    data = base64.b64encode(path.read_bytes()).decode("ascii")
+    return MetadataValue.md(f"![{alt}](data:image/png;base64,{data})")
 
 
 @asset
@@ -70,6 +86,15 @@ def raw_dataset(context: AssetExecutionContext) -> dict:
     image_paths = [str(image_dir / f) for f in df["filename"].tolist()]
     context.log.info("Rows: %d | image files referenced: %d", len(df), len(image_paths))
 
+    target = df["fresh_weight_total"]
+    context.add_output_metadata({
+        "num_rows": MetadataValue.int(len(df)),
+        "num_image_files": MetadataValue.int(len(image_paths)),
+        "target_missing": MetadataValue.int(int(target.isna().sum())),
+        "target_mean_g": MetadataValue.float(float(target.mean())),
+        "target_std_g": MetadataValue.float(float(target.std())),
+    })
+
     return {
         "metadata": df,
         "image_paths": image_paths,
@@ -78,36 +103,51 @@ def raw_dataset(context: AssetExecutionContext) -> dict:
 
 
 @asset
-def preprocessed_data(context: AssetExecutionContext, raw_dataset: dict) -> dict:
-    _seed_everything(CONFIG.seed)
+def preprocessed_data(
+    context: AssetExecutionContext, config: PreprocessConfig, raw_dataset: dict
+) -> dict:
+    _seed_everything(config.seed)
 
     df = raw_dataset["metadata"]
     image_dir = Path(raw_dataset["image_dir"])
 
-    train_df, val_df = split_dataframe(df, CONFIG.val_fraction, CONFIG.seed)
+    train_df, val_df = split_dataframe(df, config.val_fraction, config.seed)
     context.log.info("Train rows: %d | val rows: %d", len(train_df), len(val_df))
 
-    train_tf, val_tf = build_transforms(CONFIG.image_size)
+    train_tf, val_tf = build_transforms(config.image_size)
     train_ds = BiomassDataset(train_df, image_dir, train_tf)
     val_ds = BiomassDataset(val_df, image_dir, val_tf)
     train_loader = DataLoader(
         train_ds,
-        batch_size=CONFIG.batch_size,
+        batch_size=config.batch_size,
         shuffle=True,
-        num_workers=CONFIG.num_workers,
+        num_workers=config.num_workers,
     )
     val_loader = DataLoader(
         val_ds,
-        batch_size=CONFIG.batch_size,
+        batch_size=config.batch_size,
         shuffle=False,
-        num_workers=CONFIG.num_workers,
+        num_workers=config.num_workers,
     )
+
+    context.add_output_metadata({
+        "n_train": MetadataValue.int(len(train_ds)),
+        "n_val": MetadataValue.int(len(val_ds)),
+        "batch_size": MetadataValue.int(config.batch_size),
+        "image_size": MetadataValue.int(config.image_size),
+        "val_fraction": MetadataValue.float(config.val_fraction),
+    })
 
     return {
         "train_loader": train_loader,
         "val_loader": val_loader,
         "n_train": len(train_ds),
         "n_val": len(val_ds),
+        "batch_size": config.batch_size,
+        "image_size": config.image_size,
+        "val_fraction": config.val_fraction,
+        "num_workers": config.num_workers,
+        "seed": config.seed,
     }
 
 
@@ -138,31 +178,54 @@ def eda_plots(context: AssetExecutionContext, raw_dataset: dict) -> dict:
     plt.close(fig)
 
     context.log.info("EDA plots: %s, %s", target_path, age_path)
+    context.add_output_metadata({
+        "target_distribution": _png_as_markdown(target_path, "target distribution"),
+        "age_vs_biomass": _png_as_markdown(age_path, "biomass vs age"),
+        "target_distribution_path": MetadataValue.path(str(target_path)),
+        "age_vs_biomass_path": MetadataValue.path(str(age_path)),
+    })
     return {"target_distribution": str(target_path), "age_vs_biomass": str(age_path)}
 
 
 @asset(required_resource_keys={"mlflow"})
-def trained_model(context: AssetExecutionContext, preprocessed_data: dict) -> dict:
-    _seed_everything(CONFIG.seed)
+def trained_model(
+    context: AssetExecutionContext, config: TrainingConfig, preprocessed_data: dict
+) -> dict:
+    _seed_everything(config.seed)
     device = pick_device()
     context.log.info("Device: %s", device)
 
     train_loader: DataLoader = preprocessed_data["train_loader"]
     val_loader: DataLoader = preprocessed_data["val_loader"]
 
-    model = build_model(CONFIG.model_name, CONFIG.freeze_backbone).to(device)
+    # Combine the training config with the data-shape fields decided upstream so
+    # everything stays consistent for logging, the checkpoint and evaluation.
+    config_dict = {
+        "epochs": config.epochs,
+        "batch_size": preprocessed_data["batch_size"],
+        "learning_rate": config.learning_rate,
+        "model_name": config.model_name,
+        "image_size": preprocessed_data["image_size"],
+        "val_fraction": preprocessed_data["val_fraction"],
+        "seed": config.seed,
+        "freeze_backbone": config.freeze_backbone,
+        "max_train_batches": config.max_train_batches,
+        "num_workers": preprocessed_data["num_workers"],
+    }
+
+    model = build_model(config.model_name, config.freeze_backbone).to(device)
     trainable = [p for p in model.parameters() if p.requires_grad]
-    optimizer = optim.Adam(trainable, lr=CONFIG.learning_rate)
+    optimizer = optim.Adam(trainable, lr=config.learning_rate)
     criterion = nn.MSELoss()
 
     mlflow.log_params({
-        "epochs": CONFIG.epochs,
-        "batch_size": CONFIG.batch_size,
-        "learning_rate": CONFIG.learning_rate,
-        "model_name": CONFIG.model_name,
-        "image_size": CONFIG.image_size,
-        "freeze_backbone": CONFIG.freeze_backbone,
-        "max_train_batches": CONFIG.max_train_batches,
+        "epochs": config.epochs,
+        "batch_size": preprocessed_data["batch_size"],
+        "learning_rate": config.learning_rate,
+        "model_name": config.model_name,
+        "image_size": preprocessed_data["image_size"],
+        "freeze_backbone": config.freeze_backbone,
+        "max_train_batches": config.max_train_batches,
         "n_train": preprocessed_data["n_train"],
         "n_val": preprocessed_data["n_val"],
     })
@@ -172,10 +235,10 @@ def trained_model(context: AssetExecutionContext, preprocessed_data: dict) -> di
     }
     best_val_mse = float("inf")
 
-    for epoch in range(1, CONFIG.epochs + 1):
+    for epoch in range(1, config.epochs + 1):
         train_mse, train_mae = run_epoch(
             model, train_loader, criterion, optimizer, device,
-            max_batches=CONFIG.max_train_batches,
+            max_batches=config.max_train_batches,
         )
         val_mse, val_mae = run_epoch(model, val_loader, criterion, None, device)
         history["train_mse"].append(train_mse)
@@ -190,24 +253,36 @@ def trained_model(context: AssetExecutionContext, preprocessed_data: dict) -> di
 
         context.log.info(
             "Epoch %d/%d | train MSE %.5f MAE %.5f | val MSE %.5f MAE %.5f",
-            epoch, CONFIG.epochs, train_mse, train_mae, val_mse, val_mae,
+            epoch, config.epochs, train_mse, train_mae, val_mse, val_mae,
         )
         best_val_mse = min(best_val_mse, val_mse)
 
     model_path = RESULTS_DIR / "model.pt"
     torch.save({
         "model_state_dict": model.state_dict(),
-        "config": asdict(CONFIG),
+        "config": config_dict,
         "best_val_mse": best_val_mse,
     }, model_path)
     mlflow.log_artifact(str(model_path), artifact_path="model")
     context.log.info("Model saved to %s", model_path)
 
+    context.add_output_metadata({
+        "best_val_mse": MetadataValue.float(best_val_mse),
+        "last_train_mse": MetadataValue.float(history["train_mse"][-1]),
+        "last_val_mse": MetadataValue.float(history["val_mse"][-1]),
+        "last_val_mae": MetadataValue.float(history["val_mae"][-1]),
+        "epochs": MetadataValue.int(config.epochs),
+        "learning_rate": MetadataValue.float(config.learning_rate),
+        "model_name": MetadataValue.text(config.model_name),
+        "freeze_backbone": MetadataValue.bool(config.freeze_backbone),
+        "model_path": MetadataValue.path(str(model_path)),
+    })
+
     return {
         "model_state_dict": model.state_dict(),
         "history": history,
         "best_val_mse": best_val_mse,
-        "config": asdict(CONFIG),
+        "config": config_dict,
     }
 
 
@@ -275,6 +350,16 @@ def model_evaluation(
     mlflow.log_artifact(str(metrics_path), artifact_path="evaluation")
 
     context.log.info("Saved %s, %s, %s", curves_path, parity_path, metrics_path)
+    context.add_output_metadata({
+        "final_val_mse": MetadataValue.float(val_mse),
+        "final_val_mae": MetadataValue.float(val_mae),
+        "n_val": MetadataValue.int(int(len(targets_a))),
+        "target_mean_g": MetadataValue.float(float(targets_a.mean())),
+        "target_std_g": MetadataValue.float(float(targets_a.std())),
+        "training_curves": _png_as_markdown(curves_path, "training curves"),
+        "parity_plot": _png_as_markdown(parity_path, "parity plot"),
+        "metrics_file": MetadataValue.path(str(metrics_path)),
+    })
     return {
         "val_mse": val_mse,
         "val_mae": val_mae,

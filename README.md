@@ -88,3 +88,53 @@ mlflow ui --backend-store-uri sqlite:///mlflow.db
 | Best val MSE | 0.0660 g² |
 | Final val MAE | 0.176 g |
 | Target std on val | 0.296 g |
+
+## 5. Implemented Improvements (Lab Session 2)
+
+During the joint improvement session we added the two enhancements suggested on
+the task sheet — **configurable options via Dagster config classes/launchpad**
+and **plots & metrics surfaced directly in Dagster**.
+
+### Configurable options (Config classes + launchpad)
+
+The previously hard-coded `TrainConfig` constant was replaced by two
+`dagster.Config` classes in `dagster_pipeline.py`:
+
+- `PreprocessConfig` — `image_size`, `batch_size`, `val_fraction`, `seed`, `num_workers`
+- `TrainingConfig` — `epochs`, `learning_rate`, `model_name`, `freeze_backbone`, `max_train_batches`, `seed`
+
+Every field keeps a default, so **"Materialize all" still works without any
+config**, while the **launchpad** now lets you override each value per run
+(e.g. switch `model_name` to `resnet50` or raise `epochs`). Example launchpad
+config:
+
+```yaml
+ops:
+  preprocessed_data:
+    config:
+      batch_size: 16
+      image_size: 128
+  trained_model:
+    config:
+      epochs: 5
+      model_name: resnet50
+```
+
+### Plots & metrics in Dagster
+
+Each asset now attaches metadata via `context.add_output_metadata(...)`, so the
+numbers and figures show up on the **asset detail / materialization view** in the
+Dagster UI (not only in MLflow):
+
+- `raw_dataset` — row/image counts, target mean/std, missing-value count
+- `preprocessed_data` — `n_train`, `n_val`, effective `batch_size` / `image_size`
+- `eda_plots` — target-distribution and biomass-vs-age plots embedded inline
+- `trained_model` — `best_val_mse`, last-epoch metrics, hyper-parameters, model path
+- `model_evaluation` — `final_val_mse` / `final_val_mae` plus the training-curve and parity plots embedded inline
+
+Numeric metadata (e.g. `best_val_mse`) is also plotted by Dagster across
+materializations, giving a quick history view next to MLflow.
+
+### Screenshot
+
+![Dagster asset metadata with embedded plots and metrics](screenshots/dagster_asset_metadata.png)
